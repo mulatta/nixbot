@@ -79,7 +79,7 @@ def test_eval_command(tmp_path: Path) -> None:
 
 
 def test_eval_command_pins_worktree_rev(tmp_path: Path) -> None:
-    repo = init_upstream(tmp_path / "wt")
+    repo = init_upstream(tmp_path / "work tree")
     settings = EvalSettings(gc_roots_dir=tmp_path / "gcroots")
 
     cmd = build_eval_command(repo, BranchConfig(), settings)
@@ -87,17 +87,21 @@ def test_eval_command_pins_worktree_rev(tmp_path: Path) -> None:
 
     rev = git(repo, "rev-parse", "HEAD")
     git(repo, "checkout", "-q", "--detach")
+    pinned = f"git+{repo.as_uri()}?rev={rev}&ref=HEAD"
 
     cmd = build_eval_command(repo, BranchConfig(), settings)
-    assert cmd[cmd.index("--flake") + 1] == f"git+file://{repo}?rev={rev}"
+    assert cmd[cmd.index("--flake") + 1] == pinned
 
     cmd = build_eval_command(repo, BranchConfig(flake_dir="sub"), settings)
-    assert cmd[cmd.index("--flake") + 1] == f"git+file://{repo}?rev={rev}&dir=sub"
+    assert cmd[cmd.index("--flake") + 1] == f"{pinned}&dir=sub"
+
+    cmd = build_eval_command(repo, BranchConfig(flake_dir="sub dir&part#%"), settings)
+    assert cmd[cmd.index("--flake") + 1] == f"{pinned}&dir=sub%20dir%26part%23%25"
 
     cmd = build_eval_command(
         repo, BranchConfig(attribute="hydraJobs", legacy_eval=True), settings
     )
-    assert cmd[cmd.index("--flake") + 1] == f"git+file://{repo}?rev={rev}#hydraJobs"
+    assert cmd[cmd.index("--flake") + 1] == f"{pinned}#hydraJobs"
 
 
 def test_eval_command_legacy_eval(tmp_path: Path) -> None:

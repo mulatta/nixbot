@@ -4,8 +4,9 @@ One central persistent bare clone per project. Each build gets its own
 git worktree from that clone so concurrent builds of the same project
 never re-fetch. Worktrees are removed after the build. Clones are a
 cache: on corruption they are deleted and re-cloned. A per-project lock
-serializes fetches; `git worktree prune` plus an orphan sweep runs at
-startup and periodically, as does `git gc`.
+serializes operations that can rewrite or lazily fetch objects; `git
+worktree prune` plus an orphan sweep runs at startup and periodically,
+as does `git gc`.
 
 PR builds merge the PR head into the base branch locally in the
 worktree. A conflict is a failed build. Build identity is the
@@ -24,9 +25,10 @@ import itertools
 import logging
 import os
 import shutil
+import signal
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 from urllib.parse import urlsplit
@@ -41,6 +43,17 @@ PR_REF_MAX_AGE = 90 * 86400
 # Crash-leaked plain files next to worktrees (e.g. effects side-files)
 # are swept once clearly older than any running build.
 ORPHAN_FILE_MAX_AGE = 86400
+
+# Bare repositories enable reachability bitmaps by default. Blobless partial
+# clones cannot write complete bitmaps once local merge commits reference
+# promisor objects, so implicit maintenance fails and small packs accumulate.
+MANAGED_REPO_CONFIG = (
+    ("repack.writeBitmaps", "false"),
+    ("maintenance.auto", "false"),
+    ("gc.autoDetach", "false"),
+)
+BITMAP_GC_FAILURE = "Failed to write bitmap index. Packfile doesn't have full closure"
+GIT_TERMINATE_TIMEOUT = 5.0
 
 
 def pr_refspec(forge: str, pr_number: int) -> str:
@@ -117,6 +130,64 @@ class StaticCredentialsProvider:
         return FetchCredentials(netrc_file=self.netrc_file)
 
 
+async def _wait_uncancelled[T](task: asyncio.Task[T]) -> T:
+    """Finish cleanup even when its caller receives repeated cancellation."""
+    while True:
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.done():
+                return task.result()
+            continue
+
+
+async def _terminate_git(proc: asyncio.subprocess.Process) -> None:
+    """Let Git clean up locks, then kill helpers that outlive it."""
+    with contextlib.suppress(ProcessLookupError, OSError):
+        os.killpg(proc.pid, signal.SIGTERM)
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=GIT_TERMINATE_TIMEOUT)
+    except TimeoutError:
+        with contextlib.suppress(ProcessLookupError, OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        await proc.wait()
+    else:
+        with contextlib.suppress(ProcessLookupError, OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
+
+
+async def _spawn_git(
+    args: list[str], cwd: Path | None, env: dict[str, str]
+) -> asyncio.subprocess.Process:
+    """Spawn Git without losing its process-group handle to cancellation."""
+    spawn_task = asyncio.create_task(
+        asyncio.create_subprocess_exec(
+            "git",
+            *(
+                option
+                for key, value in MANAGED_REPO_CONFIG
+                for option in ("-c", f"{key}={value}")
+            ),
+            *args,
+            cwd=cwd,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+    )
+    try:
+        return await asyncio.shield(spawn_task)
+    except asyncio.CancelledError as cancelled:
+        try:
+            proc = await _wait_uncancelled(spawn_task)
+        except Exception as spawn_error:
+            raise cancelled from spawn_error
+        cleanup = asyncio.create_task(_terminate_git(proc))
+        await _wait_uncancelled(cleanup)
+        raise
+
+
 async def run_git(
     args: list[str],
     *,
@@ -151,21 +222,53 @@ async def run_git(
     else:
         home = None
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "git",
-            *args,
-            cwd=cwd,
-            env=env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
+        proc = await _spawn_git(args, cwd, env)
+        try:
+            stdout, stderr = await proc.communicate()
+        except BaseException:
+            # Keep the repository lock until no helper can continue
+            # rewriting the object database.
+            cleanup = asyncio.create_task(_terminate_git(proc))
+            await _wait_uncancelled(cleanup)
+            raise
         if proc.returncode != 0:
             raise GitError(args, proc.returncode or -1, stderr.decode(errors="replace"))
         return stdout.decode(errors="replace")
     finally:
         if home is not None:
             shutil.rmtree(home, ignore_errors=True)
+
+
+async def _configure_managed_clone(path: Path) -> None:
+    """Apply maintenance policy and unblock clones affected by bitmap GC."""
+    output = await run_git(["config", "--local", "--list"], cwd=path)
+    current: dict[str, list[str]] = {}
+    for line in output.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            current.setdefault(key.lower(), []).append(value)
+    for key, value in MANAGED_REPO_CONFIG:
+        if current.get(key.lower()) != [value]:
+            await run_git(["config", "--local", "--replace-all", key, value], cwd=path)
+
+    gc_log = path / "gc.log"
+    try:
+        failed = BITMAP_GC_FAILURE in gc_log.read_text(errors="replace")
+    except OSError:
+        return
+    if failed:
+        try:
+            gc_log.unlink(missing_ok=True)
+        except OSError:
+            logger.warning(
+                "failed to clear partial-clone gc log",
+                extra={"clone": str(path)},
+                exc_info=True,
+            )
+        else:
+            logger.info(
+                "cleared failed partial-clone gc log", extra={"clone": str(path)}
+            )
 
 
 def _push_url_rewrites(push_url: str) -> list[tuple[str, str]]:
@@ -198,6 +301,7 @@ class Worktree:
 
     path: Path
     clone_path: Path
+    _repo_lock: asyncio.Lock = field(repr=False, compare=False)
 
     async def rev_parse(self, rev: str) -> str:
         return (await run_git(["rev-parse", rev], cwd=self.path)).strip()
@@ -212,11 +316,14 @@ class Worktree:
     async def merge(
         self, head_sha: str, credentials: FetchCredentials | None = None
     ) -> None:
-        """Merge `head_sha` into the currently checked-out base branch.
+        """Merge `head_sha` while excluding repository maintenance."""
+        async with self._repo_lock:
+            await self._merge(head_sha, credentials)
 
-        Raises MergeConflictError on conflict. The caller fails the
-        build and reports the status on the head SHA.
-        """
+    async def _merge(
+        self, head_sha: str, credentials: FetchCredentials | None = None
+    ) -> None:
+        """Merge into the base, classifying content conflicts separately."""
         try:
             await run_git(
                 [
@@ -258,7 +365,7 @@ class RepoManager:
         self.worktrees_dir = state_dir / "worktrees"
         self.clones_dir.mkdir(parents=True, exist_ok=True)
         self.worktrees_dir.mkdir(parents=True, exist_ok=True)
-        self._fetch_locks: dict[str, asyncio.Lock] = {}
+        self._repo_locks: dict[str, asyncio.Lock] = {}
         # Live checkouts, tracked independently of git metadata: after
         # a corruption re-clone the new clone knows no worktrees, and
         # the orphan sweep must not delete those of running builds.
@@ -269,8 +376,11 @@ class RepoManager:
         # project_key like "github/owner/repo". One directory per project.
         return self.clones_dir / project_key / "clone.git"
 
+    def _project_key(self, clone: Path) -> str:
+        return clone.parent.relative_to(self.clones_dir).as_posix()
+
     def _lock(self, project_key: str) -> asyncio.Lock:
-        return self._fetch_locks.setdefault(project_key, asyncio.Lock())
+        return self._repo_locks.setdefault(project_key, asyncio.Lock())
 
     async def fetch(
         self,
@@ -327,11 +437,27 @@ class RepoManager:
             # checkout instead of upfront, cutting clone cost for repos
             # with large history (nixpkgs).
             await run_git(
-                ["clone", "--bare", "--filter=blob:none", url, str(path)],
+                [
+                    "clone",
+                    "--bare",
+                    "--filter=blob:none",
+                    *(f"--config={key}={value}" for key, value in MANAGED_REPO_CONFIG),
+                    url,
+                    str(path),
+                ],
                 credentials=credentials,
             )
+        await _configure_managed_clone(path)
         await run_git(
-            ["fetch", "--force", "--prune", "--filter=blob:none", url, *refspecs],
+            [
+                "fetch",
+                "--force",
+                "--prune",
+                "--filter=blob:none",
+                "--no-auto-maintenance",
+                url,
+                *refspecs,
+            ],
             cwd=path,
             credentials=credentials,
         )
@@ -345,14 +471,15 @@ class RepoManager:
     ) -> str | None:
         """Read one file from a ref of the bare clone (no worktree).
         Returns None when the ref or file does not exist."""
-        try:
-            return await run_git(
-                ["show", f"{ref}:{file_path}"],
-                cwd=self.clone_path(project_key),
-                credentials=credentials,
-            )
-        except GitError:
-            return None
+        async with self._lock(project_key):
+            try:
+                return await run_git(
+                    ["show", f"{ref}:{file_path}"],
+                    cwd=self.clone_path(project_key),
+                    credentials=credentials,
+                )
+            except GitError:
+                return None
 
     async def create_worktree(
         self,
@@ -362,56 +489,99 @@ class RepoManager:
         credentials: FetchCredentials | None = None,
     ) -> Worktree:
         """Create a detached worktree for one build at `commit`."""
+        async with self._lock(project_key):
+            return await self._create_worktree(
+                project_key, worktree_id, commit, credentials
+            )
+
+    async def _create_worktree(
+        self,
+        project_key: str,
+        worktree_id: str,
+        commit: str,
+        credentials: FetchCredentials | None,
+    ) -> Worktree:
         clone = self.clone_path(project_key)
         path = self.worktrees_dir / f"{worktree_id}-{next(self._worktree_seq)}"
+        worktree = Worktree(
+            path=path, clone_path=clone, _repo_lock=self._lock(project_key)
+        )
         # Stale directory from a previous process.
         if path.exists():
-            await self.remove_worktree(Worktree(path=path, clone_path=clone))
+            await self._remove_worktree(worktree)
         path.parent.mkdir(parents=True, exist_ok=True)
-        await run_git(
-            ["worktree", "add", "--detach", str(path), commit],
-            cwd=clone,
-            credentials=credentials,
-        )
+        try:
+            await run_git(
+                ["worktree", "add", "--detach", str(path), commit],
+                cwd=clone,
+                credentials=credentials,
+            )
+        except BaseException:
+            # Git may register the worktree before cancellation reaches it.
+            cleanup = asyncio.create_task(self._remove_worktree(worktree))
+            await _wait_uncancelled(cleanup)
+            raise
         self._active_worktrees.add(path.resolve())
-        return Worktree(path=path, clone_path=clone)
+        return worktree
 
     async def remove_worktree(self, worktree: Worktree) -> None:
-        self._active_worktrees.discard(worktree.path.resolve())
+        project_key = self._project_key(worktree.clone_path)
+        async with self._lock(project_key):
+            await self._remove_worktree(worktree)
+
+    async def _remove_worktree(self, worktree: Worktree) -> None:
         try:
             await run_git(
                 ["worktree", "remove", "--force", str(worktree.path)],
                 cwd=worktree.clone_path,
             )
         except GitError:
-            shutil.rmtree(worktree.path, ignore_errors=True)
-            with contextlib.suppress(GitError):
-                await run_git(["worktree", "prune"], cwd=worktree.clone_path)
+            await self._force_remove_worktree(worktree)
+        except BaseException:
+            cleanup = asyncio.create_task(self._force_remove_worktree(worktree))
+            await _wait_uncancelled(cleanup)
+            raise
+        finally:
+            self._active_worktrees.discard(worktree.path.resolve())
+
+    @staticmethod
+    async def _force_remove_worktree(worktree: Worktree) -> None:
+        shutil.rmtree(worktree.path, ignore_errors=True)
+        with contextlib.suppress(GitError):
+            await run_git(["worktree", "prune"], cwd=worktree.clone_path)
 
     async def cleanup(self) -> None:
         """Prune stale worktrees/PR refs and sweep orphans. Run at
         startup and periodically."""
-        for clone in self.clones_dir.rglob("clone.git"):
-            await self._prune_stale_pr_refs(clone)
+        clones = list(self.clones_dir.rglob("clone.git"))
+        for clone in clones:
+            async with self._lock(self._project_key(clone)):
+                await self._prune_stale_pr_refs(clone)
         # Snapshot candidates before scanning the clones: a worktree
         # created mid-scan would be missing from `registered` and must
         # not become a sweep candidate.
         candidates = {entry.resolve() for entry in self.worktrees_dir.iterdir()}
         registered = set(self._active_worktrees)
-        for clone in self.clones_dir.rglob("clone.git"):
-            with contextlib.suppress(GitError):
-                await run_git(["worktree", "prune"], cwd=clone)
-            try:
-                output = await run_git(["worktree", "list", "--porcelain"], cwd=clone)
-            except GitError as e:
-                # Fail closed: treating an unreadable clone as "no
-                # worktrees" would sweep live build checkouts.
-                logger.warning(
-                    "git worktree list failed, skipping orphan sweep",
-                    extra={"clone": str(clone), "stderr": e.stderr},
-                )
-                return
-            registered.update(_worktree_paths(output))
+        for clone in clones:
+            async with self._lock(self._project_key(clone)):
+                with contextlib.suppress(GitError):
+                    await run_git(["worktree", "prune"], cwd=clone)
+                try:
+                    output = await run_git(
+                        ["worktree", "list", "--porcelain"], cwd=clone
+                    )
+                except GitError as e:
+                    # Fail closed: treating an unreadable clone as "no
+                    # worktrees" would sweep live build checkouts.
+                    logger.warning(
+                        "git worktree list failed, skipping orphan sweep",
+                        extra={"clone": str(clone), "stderr": e.stderr},
+                    )
+                    return
+                registered.update(_worktree_paths(output))
+        # Effect clones are standalone and absent from `git worktree list`.
+        # Refresh after awaits so a path reused during this scan stays live.
+        registered.update(self._active_worktrees)
         for entry in candidates - registered:
             if entry.is_dir():
                 # Orphan sweep: worktree directories no clone knows about.
@@ -447,10 +617,22 @@ class RepoManager:
                         await run_git(["update-ref", "-d", refname], cwd=clone)
 
     async def gc(self) -> None:
-        """Periodic `git gc` over all clones."""
+        """Migrate and maintain clones without racing repository writers."""
         for clone in self.clones_dir.rglob("clone.git"):
-            with contextlib.suppress(GitError):
-                await run_git(["gc", "--auto"], cwd=clone)
+            project_key = self._project_key(clone)
+            async with self._lock(project_key):
+                try:
+                    await _configure_managed_clone(clone)
+                    await run_git(["gc", "--auto"], cwd=clone)
+                except (GitError, OSError) as e:
+                    logger.warning(
+                        "git gc failed",
+                        extra={
+                            "project": project_key,
+                            "clone": str(clone),
+                            "stderr": e.stderr if isinstance(e, GitError) else str(e),
+                        },
+                    )
 
     async def checkout_for_build(  # noqa: PLR0913
         self,
@@ -467,21 +649,25 @@ class RepoManager:
         bare clone does not carry submodule objects) WITHOUT the fetch
         credentials unless explicitly opted in. Returns the worktree;
         identity is its tree hash."""
-        worktree = await self.create_worktree(
-            project_key, worktree_id, base_commit, credentials
-        )
+        worktree: Worktree | None = None
         try:
-            if head_commit is not None and head_commit != base_commit:
-                await worktree.merge(head_commit, credentials)
-            # .gitmodules is PR-controlled: with the primary repo's
-            # credentials a malicious PR could exfiltrate any other
-            # private repo on the same forge via build outputs.
+            async with self._lock(project_key):
+                worktree = await self._create_worktree(
+                    project_key, worktree_id, base_commit, credentials
+                )
+                if head_commit is not None and head_commit != base_commit:
+                    await worktree._merge(head_commit, credentials)  # noqa: SLF001
+            # .gitmodules is PR-controlled network input. It operates on
+            # independent submodule repositories, so do not let it block
+            # shared-clone operations for the project.
             await self._init_submodules(worktree.path, submodule_credentials)
         except BaseException:
             # Callers only remove worktrees they received. A failed
             # merge or submodule checkout (or cancellation) must not
             # leak a registered worktree.
-            await self.remove_worktree(worktree)
+            if worktree is not None:
+                cleanup = asyncio.create_task(self.remove_worktree(worktree))
+                await _wait_uncancelled(cleanup)
             raise
         return worktree
 
@@ -507,32 +693,35 @@ class RepoManager:
         push_url: str | None = None,
         submodule_credentials: FetchCredentials | None = None,
     ) -> Path:
-        """Standalone, pushable clone for one effect run, cloned locally
-        from the bare mirror (the build worktree already materialized
-        the commit's blobs there). `origin` becomes `push_url` (token
-        https URL) plus insteadOf rewrites for the forge's plain
-        https/ssh remotes. The token never touches the shared mirror or
-        worktree. Removed by the caller via `remove_effect_clone`."""
+        """Create a standalone pushable clone for one effect run.
+
+        Build checkout has already materialized the commit blobs in the
+        shared mirror. Credentials never touch that mirror.
+        """
         clone = self.clone_path(project_key)
+        active_path = await asyncio.to_thread(dest.resolve)
         # A leftover from a crashed run must not survive into git clone.
         shutil.rmtree(dest, ignore_errors=True)
         dest.parent.mkdir(parents=True, exist_ok=True)
         try:
-            await run_git(["clone", "--no-checkout", str(clone), str(dest)])
-            if push_url is not None:
-                # Before checkout: any lazy blob fetch (blobless mirror)
-                # then goes to the forge with the token.
-                await run_git(["remote", "set-url", "origin", push_url], cwd=dest)
-                for key, prefix in _push_url_rewrites(push_url):
-                    await run_git(["config", "--add", key, prefix], cwd=dest)
-            await run_git(["checkout", "--detach", commit], cwd=dest)
+            async with self._lock(project_key):
+                await run_git(["clone", "--no-checkout", str(clone), str(dest)])
+                if push_url is not None:
+                    # Before checkout: any lazy blob fetch then goes to
+                    # the forge with the token, not the shared mirror.
+                    await run_git(["remote", "set-url", "origin", push_url], cwd=dest)
+                    for key, prefix in _push_url_rewrites(push_url):
+                        await run_git(["config", "--add", key, prefix], cwd=dest)
+                await run_git(["checkout", "--detach", commit], cwd=dest)
+                # Register before releasing the lock so cleanup cannot
+                # mistake this reused path for the stale clone it replaced.
+                self._active_worktrees.add(active_path)
+            # Recursive submodule network I/O is independent of the shared clone.
             await self._init_submodules(dest, submodule_credentials)
         except BaseException:
+            self._active_worktrees.discard(active_path)
             shutil.rmtree(dest, ignore_errors=True)
             raise
-        # Track like a worktree so the periodic orphan sweep does not
-        # delete the directory of a running effect.
-        self._active_worktrees.add(await asyncio.to_thread(dest.resolve))
         return dest
 
     def remove_effect_clone(self, dest: Path) -> None:
